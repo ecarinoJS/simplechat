@@ -82,12 +82,18 @@ class ChatController extends Controller
                 return response()->json(['error' => 'Unauthorized'], 401);
             }
 
-            $limit = min($request->get('limit', 50), 100);
+            // Allow loading all messages with a high default limit
+            // Client can specify limit via ?limit= parameter
+            $limit = $request->get('limit');
             $after = $request->get('after');
 
             $query = Message::with('user')
-                ->orderBy('created_at', 'desc')
-                ->limit($limit);
+                ->orderBy('created_at', 'desc');
+
+            if ($limit !== null) {
+                // Apply limit only if specified (with safety cap)
+                $query->limit(min((int)$limit, 10000));
+            }
 
             if ($after) {
                 // Parse the ISO 8601 timestamp properly with Carbon
