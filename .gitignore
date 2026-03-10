@@ -1,0 +1,61 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Laravel
+backend/storage/*.key
+backend/.env
+backend/.env.backup
+backend/.env.production
+backend/phpunit.xml
+backend/.phpunit.result.cache
+backend/Homestead.json
+backend/Homestead.yaml
+backend/npm-debug.log
+backend/yarn-error.log
+
+# Next.js
+frontend/.next/
+frontend/out/
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+backend/storage/logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Testing
+frontend/coverage/
+.nyc_output/
+
+# Misc
+.claude/
+*.pid
+*.seed
+*.pid.lock
+.pnp.*
