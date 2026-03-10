@@ -21,6 +21,14 @@ class ChatController extends Controller
     public function sendMessage(Request $request, AzurePubSubPublisher $publisher)
     {
         try {
+            // Log request for debugging
+            Log::info('sendMessage request', [
+                'method' => $request->method(),
+                'content' => $request->input('content'),
+                'all' => $request->all(),
+                'json' => $request->json()->all(),
+            ]);
+
             // Validate the request
             $validated = $request->validate([
                 'content' => 'required|string|max:1000',
