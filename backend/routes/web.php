@@ -3,7 +3,6 @@
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\ChatController;
 use App\Http\Controllers\PubSubController;
-use App\Http\Controllers\WebPubSubEventHandler;
 use Illuminate\Support\Facades\Route;
 
 /*
@@ -37,5 +36,5 @@ Route::post('/api/messages/send', [ChatController::class, 'sendMessage'])->middl
 // Get messages endpoint - requires authentication
 Route::get('/api/messages', [ChatController::class, 'getMessages'])->middleware('auth');
 
-// Azure Web PubSub event handler (called by Azure service)
-Route::post('/api/webpubsub/events', [WebPubSubEventHandler::class, 'handle']);
+// Note: In Serverless mode, NO event handler route is needed
+// Azure automatically manages connections without upstream events

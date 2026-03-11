@@ -21,6 +21,8 @@
 ### 1.1 Purpose
 SimpleChat is a real-time chat application demonstrating the integration of Laravel (PHP) backend with Next.js (React/TypeScript) frontend using Azure Web PubSub for WebSocket communication.
 
+**IMPORTANT:** This application uses Azure Web PubSub in **Serverless** mode, which provides a simpler architecture without requiring an upstream event handler endpoint.
+
 ### 1.2 Key Features
 - Real-time message broadcasting using WebSocket
 - Session-based authentication with Laravel Sanctum
@@ -46,7 +48,7 @@ SimpleChat is a real-time chat application demonstrating the integration of Lara
 
 ## 2. Technical Architecture
 
-### 2.1 System Architecture Diagram
+### 2.1 System Architecture Diagram (Serverless Mode)
 
 ```
 ┌─────────────────┐         ┌──────────────────┐         ┌─────────────────┐
@@ -56,16 +58,33 @@ SimpleChat is a real-time chat application demonstrating the integration of Lara
 │                 │         │                  │         │                 │
 └────────┬────────┘         └────────┬─────────┘         └─────────────────┘
          │                           │
-         │ WebSocket                │ REST API
+         │                           │
+         │ WebSocket (Socket.IO)      │ REST API (Broadcast)
          │                           │
          ▼                           ▼
 ┌─────────────────┐         ┌──────────────────┐
 │                 │         │                  │
-│ Azure Web PubSub│◄────────│  JWT Token       │
-│  (Socket.IO)    │         │  Generation      │
+│ Azure Web PubSub│◄────────│  JWT Service     │
+│  (Serverless)   │         │  Token + REST    │
 │                 │         │                  │
-└─────────────────┘         └──────────────────┘
+└────────┬────────┘         └──────────────────┘
+         │
+         │
+         ▼
+┌─────────────────┐
+│                 │
+│  All Connected  │
+│  Clients        │
+│  (Auto-managed) │
+│                 │
+└─────────────────┘
 ```
+
+**Key Difference in Serverless Mode:**
+- No event handler endpoint needed
+- Azure automatically manages connections
+- Backend only uses REST API to broadcast messages
+- Simpler architecture with fewer moving parts
 
 ### 2.2 Data Flow
 
@@ -149,8 +168,7 @@ backend/
 │   │   └── Controllers/
 │   │       ├── AuthController.php
 │   │       ├── ChatController.php
-│   │       ├── PubSubController.php
-│   │       └── WebPubSubEventHandler.php
+│   │       └── PubSubController.php
 │   ├── Models/
 │   │   ├── User.php (Laravel default)
 │   │   └── Message.php
@@ -173,6 +191,8 @@ backend/
 └── bootstrap/
     └── app.php
 ```
+
+**Note:** In Serverless mode, `WebPubSubEventHandler.php` is **not required** since Azure manages connections automatically without needing an upstream event handler.
 
 ### 4.2 Model Implementations
 
@@ -421,6 +441,7 @@ class AzurePubSubPublisher
 
     /**
      * Broadcast a Socket.IO event to all connected clients.
+     * In Serverless mode, this broadcasts to all clients in the default group.
      *
      * @param string $event The Socket.IO event name
      * @param mixed $data The data to broadcast
@@ -460,8 +481,41 @@ class AzurePubSubPublisher
     }
 
     /**
-     * Add a connection to a group.
-     * Used by event handler to manage Socket.IO connections.
+     * Send a message to a specific user (optional, for targeted messaging).
+     * In Serverless mode, this can be used for direct user-to-user messages.
+     */
+    public function sendToUser(string $userId, string $event, mixed $data): bool
+    {
+        $url = sprintf(
+            '%s/api/hubs/%s/users/%s/:send',
+            $this->config->getBaseUrl(),
+            $this->config->hub,
+            $userId
+        );
+
+        try {
+            $payload = [$event, $data];
+            $response = Http::withHeaders([
+                'Authorization' => 'Bearer ' . $this->tokenService->generateServiceToken($url),
+                'Content-Type' => 'application/json',
+            ])->post($url, $payload);
+
+            return $response->successful();
+        } catch (ConnectionException $e) {
+            Log::error('Failed to send to user', [
+                'userId' => $userId,
+                'error' => $e->getMessage(),
+            ]);
+            return false;
+        }
+    }
+
+    /**
+     * Add a connection to a group (optional, advanced use only).
+     *
+     * NOTE: In Serverless mode, Azure automatically adds all connections
+     * to the default group. These methods are only needed for advanced
+     * scenarios like targeted messaging to specific groups.
      */
     public function addConnectionToGroup(string $connectionId, string $group): bool
     {
@@ -489,6 +543,12 @@ class AzurePubSubPublisher
         }
     }
 
+    /**
+     * Remove a connection from a group (optional, advanced use only).
+     *
+     * NOTE: In Serverless mode, Azure automatically handles group management.
+     * These methods are only needed for advanced scenarios.
+     */
     public function removeConnectionFromGroup(string $connectionId, string $group): bool
     {
         $url = sprintf(
@@ -516,6 +576,12 @@ class AzurePubSubPublisher
     }
 }
 ```
+
+**Serverless Mode Notes:**
+- The `broadcast()` method is the primary method used in this chat application
+- `sendToUser()` is available for targeted/direct messaging
+- `addConnectionToGroup()` and `removeConnectionFromGroup()` are optional since Azure manages connections automatically in Serverless mode
+- All Socket.IO clients are automatically added to the "default" group
 
 ### 4.4 Controller Implementations
 
@@ -714,88 +780,6 @@ class PubSubController extends Controller
 }
 ```
 
-#### Event Handler (`app/Http/Controllers/WebPubSubEventHandler.php`)
-```php
-<?php
-
-namespace App\Http\Controllers;
-
-use App\Services\AzurePubSubPublisher;
-use Illuminate\Http\Request;
-use Illuminate\Http\JsonResponse;
-use Illuminate\Support\Facades\Log;
-
-class WebPubSubEventHandler extends Controller
-{
-    protected AzurePubSubPublisher $publisher;
-
-    public function __construct(AzurePubSubPublisher $publisher)
-    {
-        $this->publisher = $publisher;
-    }
-
-    public function handle(Request $request): JsonResponse
-    {
-        $events = $request->input('events', []);
-
-        foreach ($events as $event) {
-            $this->processEvent($event);
-        }
-
-        return response()->json();
-    }
-
-    protected function processEvent(array $event): void
-    {
-        $eventType = $event['type'] ?? null;
-        $data = $event['data'] ?? [];
-        $connectionId = $data['connectionId'] ?? null;
-
-        switch ($eventType) {
-            case 'connected':
-            case 'connect':
-                $this->handleConnect($connectionId);
-                break;
-
-            case 'disconnected':
-                $this->handleDisconnect($connectionId);
-                break;
-
-            case 'userEvent':
-                $eventName = $event['eventName'] ?? null;
-                $this->handleUserEvent($eventName, $connectionId, $data);
-                break;
-        }
-    }
-
-    protected function handleConnect(?string $connectionId): void
-    {
-        if (!$connectionId) return;
-
-        // Add to default group for broadcasting
-        $this->publisher->addConnectionToGroup($connectionId, 'default');
-    }
-
-    protected function handleDisconnect(?string $connectionId): void
-    {
-        if (!$connectionId) return;
-
-        $this->publisher->removeConnectionFromGroup($connectionId, 'default');
-    }
-
-    protected function handleUserEvent(?string $eventName, ?string $connectionId, array $data): void
-    {
-        if (!$eventName || !$connectionId) return;
-
-        // Handle custom events like 'join', 'leave', etc.
-        Log::info('User event', [
-            'event' => $eventName,
-            'connectionId' => $connectionId,
-        ]);
-    }
-}
-```
-
 ### 4.5 Service Provider (`app/Providers/AppServiceProvider.php`)
 ```php
 <?php
@@ -833,7 +817,6 @@ class AppServiceProvider extends ServiceProvider
 use App\Http\Controllers\AuthController;
 use App\Http\Controllers\ChatController;
 use App\Http\Controllers\PubSubController;
-use App\Http\Controllers\WebPubSubEventHandler;
 use Illuminate\Support\Facades\Route;
 
 // Authentication routes
@@ -851,8 +834,8 @@ Route::get('/api/negotiate', [PubSubController::class, 'negotiate'])->middleware
 Route::post('/api/messages/send', [ChatController::class, 'sendMessage'])->middleware('auth');
 Route::get('/api/messages', [ChatController::class, 'getMessages'])->middleware('auth');
 
-// Azure event handler (no auth - called by Azure)
-Route::post('/api/webpubsub/events', [WebPubSubEventHandler::class, 'handle']);
+// Note: In Serverless mode, NO event handler route is needed
+// Azure automatically manages connections without upstream events
 ```
 
 #### API Routes (`routes/api.php`)
@@ -892,7 +875,7 @@ return Application::configure(basePath: dirname(__DIR__))
             'api/login',
             'api/logout',
             'api/messages/send',
-            'api/webpubsub/events',
+            // Note: No 'api/webpubsub/events' needed in Serverless mode
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
@@ -1720,7 +1703,29 @@ export default function RootLayout({
 
 ## 6. Azure Web PubSub Integration
 
-### 6.1 Azure Portal Configuration
+### 6.1 Azure Web PubSub Mode: Serverless
+
+**Important:** This application uses Azure Web PubSub in **Serverless** mode, not the default Socket.IO mode with event handlers.
+
+#### Key Differences: Serverless vs. Default Mode
+
+| Feature | Serverless Mode (This App) | Default Mode |
+|---------|---------------------------|--------------|
+| Event Handler | Not required | Required upstream server |
+| Connection Management | Automatic via Azure | Handled by backend |
+| Setup Complexity | Simple | Complex |
+| Backend Events | None needed | connect/disconnected/userEvent |
+| REST API Broadcasting | Direct to groups | Via event handler |
+
+#### Why Serverless Mode?
+
+Serverless mode is ideal for this chat application because:
+- **Simpler architecture** - No need to manage WebSocket connection lifecycle
+- **No event handler endpoint** - Backend doesn't need to be publicly accessible for Azure callbacks
+- **Easier deployment** - No need to configure event handler URLs or handle Azure webhook events
+- **Sufficient for chat** - Broadcasting to all connected clients works without connection tracking
+
+### 6.2 Azure Portal Configuration
 
 1. **Create Azure Web PubSub Resource**
    - Navigate to Azure Portal
@@ -1730,27 +1735,28 @@ export default function RootLayout({
    - Choose resource name and region
    - Click "Review + Create"
 
-2. **Configure Socket.IO Mode**
-   - Go to your Web PubSub resource
-   - Navigate to "Settings" → "Configuration"
-   - Set "Event Handler" to Socket.IO mode
-   - Configure hub name (e.g., "chat")
+2. **No Additional Configuration Required**
+   - Serverless mode requires **no event handler setup**
+   - No need to configure "Settings" → "Event Handlers"
+   - No need to set up upstream server URLs
 
 3. **Get Connection String**
+   - Go to your Web PubSub resource
    - Navigate to "Settings" → "Keys"
    - Copy the connection string
    - Format: `Endpoint=https://<name>.webpubsub.azure.com;AccessKey=<key>;Version=1.0;`
 
-4. **Configure Event Handler URL**
-   - Go to "Settings" → "Event Handlers"
-   - Add new event handler template
-   - URL pattern: `https://your-backend.com/api/webpubsub/events`
-   - System events: `connect`, `connected`, `disconnected`
-   - User events: `*`
+4. **Note the Hub Name**
+   - The hub name is configured in your application code
+   - Default hub name for this app: `chat`
+   - Hub names must match between backend and frontend
 
-### 6.2 JWT Token Structure
+### 6.3 JWT Token Structure
 
-#### Client Token (for WebSocket connection)
+#### Client Token (for WebSocket Connection)
+
+In Serverless mode, client tokens need minimal claims:
+
 ```json
 {
   "header": {
@@ -1766,7 +1772,19 @@ export default function RootLayout({
 }
 ```
 
-#### Service Token (for REST API)
+**Required Claims:**
+- `aud` (Audience): Must be the Socket.IO client URL format
+- `iat` (Issued At): Token issuance timestamp
+- `exp` (Expiration): Token expiration timestamp
+- `sub` (Subject): User ID (optional but recommended)
+
+**Optional Claims for Serverless Mode:**
+- `role`: Not typically needed in serverless mode since connections are auto-managed
+
+#### Service Token (for REST API Broadcasting)
+
+Service tokens are used by the backend to broadcast messages via the REST API:
+
 ```json
 {
   "header": {
@@ -1782,7 +1800,13 @@ export default function RootLayout({
 }
 ```
 
-### 6.3 Socket.IO Connection URL
+**Required Claims:**
+- `aud` (Audience): The REST API endpoint URL
+- `iat` (Issued At): Token issuance timestamp
+- `exp` (Expiration): Token expiration timestamp (typically short-lived, ~1 minute)
+- `role`: Must include `webpubsub.sendToGroup` for broadcasting
+
+### 6.4 Socket.IO Connection URL (Serverless Mode)
 ```
 {endpoint}/clients/socketio/hubs/{hub}
 ?access_token={jwt_token}
@@ -1790,6 +1814,42 @@ export default function RootLayout({
 Example:
 https://qaautoallies.webpubsub.azure.com/clients/socketio/hubs/chat?access_token=eyJ0eXAiOiJKV1QiLCJhbGc...
 ```
+
+### 6.5 Serverless Mode vs Default Mode Comparison
+
+| Feature | Serverless Mode (This App) | Default Mode |
+|---------|---------------------------|--------------|
+| **Event Handler** | Not required | Required upstream server |
+| **Setup Complexity** | Simple - just connection string | Complex - need webhook endpoint |
+| **Connection Management** | Automatic via Azure | Handled by backend events |
+| **Backend Files Needed** | No event handler controller | WebPubSubEventHandler required |
+| **Azure Portal Config** | None beyond resource creation | Event handler URL template needed |
+| **Public Endpoint** | Not needed | Must expose event endpoint |
+| **Group Management** | Auto-added to default group | Manual via event handler |
+| **Firewall Rules** | Outbound HTTPS only | Inbound for Azure callbacks |
+| **Ideal For** | Chat, notifications, broadcasts | Advanced connection control |
+
+### 6.6 How Serverless Mode Works in This App
+
+1. **Client Connection Flow:**
+   - Frontend requests credentials from `/api/negotiate`
+   - Backend generates JWT with client-specific claims
+   - Frontend connects directly to Azure with the JWT token
+   - Azure automatically adds connection to "default" group
+   - No backend event handler involved
+
+2. **Message Broadcasting Flow:**
+   - Frontend sends message via HTTP POST to `/api/messages/send`
+   - Backend stores message in database
+   - Backend generates service JWT (1 minute expiration)
+   - Backend calls Azure REST API: `POST /api/hubs/{hub}/groups/default/:send`
+   - Azure broadcasts to all connections in "default" group
+   - All clients receive the message via WebSocket
+
+3. **No Event Handler Needed:**
+   - Azure doesn't send connect/disconnect events to backend
+   - Backend doesn't need to handle `connected`, `disconnected`, or `userEvent` events
+   - Simpler architecture with fewer moving parts
 
 ---
 
@@ -2261,6 +2321,8 @@ server {
 }
 ```
 
+**Serverless Mode Advantage:** No need to configure Azure event handler URLs or expose a publicly accessible event endpoint. The backend only needs to make outbound REST API calls to Azure, simplifying deployment and security.
+
 ### 11.2 Frontend Deployment (Next.js)
 
 #### Build for Production
@@ -2322,24 +2384,36 @@ pm2 startup
 
 ### 11.3 Azure Web PubSub Production Setup
 
-1. **Upgrade to Standard Tier**
+1. **Upgrade to Standard Tier (Optional for Production)**
    - Navigate to your Web PubSub resource
    - Go to "Scale" settings
-   - Select "Standard" tier for production
+   - Select "Standard" tier for production workloads
    - Set capacity units based on expected load
+   - Free tier (S1) is sufficient for development and small apps
 
-2. **Configure Custom Domain**
-   - Add custom domain for SSL
-   - Update connection string
+2. **Configure Custom Domain (Optional)**
+   - Add custom domain for professional SSL certificates
+   - Update connection string if using custom domain
+   - Note: This is optional; default domain works fine
 
-3. **Set up Event Handler**
-   - Configure production backend URL
-   - Enable authentication on event handler endpoint
+3. **Serverless Mode Configuration**
+   - **NO event handler setup needed**
+   - Simply copy the connection string to production `.env`
+   - Backend makes outbound REST API calls only
+   - No webhook endpoint configuration required
 
-4. **Monitoring**
+4. **Monitoring and Alerts**
    - Enable diagnostic logs
-   - Set up metrics and alerts
-   - Configure Log Analytics workspace
+   - Set up metrics and alerts for:
+     - Connection count
+     - Message throughput
+     - Error rate
+   - Configure Log Analytics workspace if desired
+
+**Serverless Mode Benefits:**
+- Simpler setup - no event handler URLs to configure
+- Better security - no public webhook endpoint needed
+- Easier deployment - no firewall rules for incoming Azure requests
 
 ---
 
@@ -2355,18 +2429,28 @@ pm2 startup
 3. Check `SANCTUM_STATEFUL_DOMAINS` includes frontend URL
 
 #### Issue: WebSocket connection fails
-**Cause**: Invalid JWT token or expired
+**Cause**: Invalid JWT token, expired token, or incorrect hub configuration
 **Solution**:
 1. Verify Azure connection string is correct
 2. Check token expiration (default 60 minutes)
-3. Ensure hub name matches Azure configuration
+3. Ensure hub name matches between backend and frontend
+4. Verify JWT audience matches Socket.IO client URL format
 
-#### Issue: Messages not broadcasting
-**Cause**: Azure REST API call failing
+#### Issue: Messages not broadcasting to other clients
+**Cause**: Azure REST API call failing or incorrect group name
 **Solution**:
-1. Check Laravel logs for Azure response
-2. Verify service token audience matches REST API URL
-3. Ensure event handler is configured in Azure portal
+1. Check Laravel logs for Azure response: `tail -f backend/storage/logs/laravel.log`
+2. Verify service token audience matches REST API URL exactly
+3. In Serverless mode, ensure you're using the "default" group
+4. Test the REST API call manually with curl
+
+#### Issue: Messages not appearing in real-time
+**Cause**: WebSocket not connected or polling fallback not working
+**Solution**:
+1. Check browser console for Socket.IO connection status
+2. Verify the frontend is receiving the WebSocket credentials
+3. Check that `isConnected` status shows "Connected" in the UI
+4. If WebSocket fails, polling should still work every 2 seconds
 
 #### Issue: CORS errors
 **Cause**: Frontend origin not allowed
@@ -2376,10 +2460,41 @@ pm2 startup
 3. Ensure `supports_credentials` is `true`
 
 #### Issue: Polling not working
-**Cause**: Timestamp format mismatch
+**Cause**: Timestamp format mismatch or missing messages
 **Solution**:
 1. Ensure timestamps are ISO 8601 format
 2. Check timezone configuration in `config/app.php`
+3. Verify the `after` parameter URL encoding
+
+#### Issue: Azure Web PubSub "401 Unauthorized" on broadcast
+**Cause**: Service token JWT audience mismatch
+**Solution**:
+1. The service token `aud` claim must match the exact REST API URL
+2. Check `AzurePubSubConfig::getRestApiUrl()` returns correct format
+3. Ensure the URL includes `/groups/default/:send` for broadcasting
+
+#### Serverless Mode Specific Issues
+
+**Important:** In Serverless mode, these issues are **NOT applicable:
+- Event handler connection errors (no event handler needed)
+- Upstream server timeout for events
+- `connect`/`disconnect` event handling failures
+
+**Common Serverless Mode Issues:**
+
+#### Issue: "No clients receive messages"
+**Cause**: Clients not in the default group
+**Solution**:
+1. In Serverless mode, all Socket.IO clients are automatically added to the "default" group
+2. Verify your REST API call targets `/groups/default/:send`
+3. Check that clients are using the correct hub name
+
+#### Issue: Client connects but doesn't receive events
+**Cause**: JWT token missing required claims
+**Solution**:
+1. Verify client token includes `aud` for Socket.IO client URL
+2. Check that `sub` (user ID) is included if needed
+3. Ensure token hasn't expired
 
 ### 12.2 Debug Commands
 
@@ -2427,9 +2542,10 @@ sudo systemctl restart nginx
 
 ### 13.3 Azure Web PubSub Security
 - Use separate connection strings for dev/prod
-- Implement authentication on event handler endpoint
-- Set appropriate token expiration times
+- Set appropriate token expiration times (client tokens: 60 min, service tokens: 1 min)
 - Monitor for unusual connection patterns
+- **Serverless mode advantage:** No publicly accessible event handler endpoint needed
+- Keep connection strings in environment variables, never commit to git
 
 ---
 
@@ -2467,13 +2583,14 @@ CREATE INDEX idx_messages_created_at_user_id ON messages(created_at, user_id);
 | Chat Controller | `app/Http/Controllers/ChatController.php` |
 | Auth Controller | `app/Http/Controllers/AuthController.php` |
 | PubSub Controller | `app/Http/Controllers/PubSubController.php` |
-| Event Handler | `app/Http/Controllers/WebPubSubEventHandler.php` |
 | Azure Config | `app/Services/AzurePubSubConfig.php` |
 | Token Service | `app/Services/AzurePubSubTokenService.php` |
 | Publisher | `app/Services/AzurePubSubPublisher.php` |
 | Web Routes | `routes/web.php` |
 | API Routes | `routes/api.php` |
 | Azure Config | `config/azure.php` |
+
+**Note:** In Serverless mode, `WebPubSubEventHandler.php` is **not required** since Azure manages connections automatically.
 
 ### Frontend File Locations
 | File | Path |

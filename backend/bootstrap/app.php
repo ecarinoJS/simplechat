@@ -19,7 +19,7 @@ return Application::configure(basePath: dirname(__DIR__))
             'api/login',
             'api/logout',
             'api/messages/send',
-            'api/webpubsub/events', // Azure Web PubSub event handler
+            // Note: No 'api/webpubsub/events' needed in Serverless mode
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions): void {
